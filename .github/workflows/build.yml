@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'images/**']
+  pull_request:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+jobs:
+  iso:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+          echo "UG=$(id -u):$(id -g)" >> "$GITHUB_ENV"
+
+      - name: Build Glacier ISO with KIWI NG
+        run: |
+          mkdir -p output
+          sudo podman run --rm --privileged --network=host \
+            --security-opt label=type:unconfined_t \
+            -v "$PWD:$PWD" -v "$PWD/output:$PWD/output" -w "$PWD" \
+            --pull=newer \
+            registry.fedoraproject.org/fedora:45 \
+            bash -c "
+              set -euxo pipefail
+              mkdir -p output/kiwi-tmp
+              dnf install -y --setopt=install_weak_deps=False \
+                kiwi kiwi-systemdeps-iso-media distribution-gpg-keys
+              dnf clean all
+              kiwi-ng --temp-dir output/kiwi-tmp system build --description . --target-dir output
+            "
+
+      - name: Generate checksums
+        if: github.event_name != 'pull_request'
+        run: |
+          cd output
+          find . -maxdepth 3 -name '*.iso' -print0 | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload ISO artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: glacier-iso
+          path: |
+            output/*.iso
+            output/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0

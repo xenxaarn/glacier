@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+mkdir -p /etc/dconf/db/local.d
+
+cat > /etc/dconf/db/local.d/99-live-installer <<'EOF'
+[org/gnome/shell]
+favorite-apps=['org.gnome.Settings.desktop', 'firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'kitty.desktop', 'md.obsidian.Obsidian.desktop', 'anaconda.desktop']
+EOF
+
+dconf update
