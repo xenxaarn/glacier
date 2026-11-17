@@ -77,4 +77,5 @@ passwd -l root
 touch /var/lib/rpm/.updated
 touch /var/lib/rpm/.rpmdb
 
+ln -sf /usr/bin/nvim /usr/local/bin/neovim; XDG_CONFIG_HOME=/etc/skel/.config XDG_DATA_HOME=/etc/skel/.local/share XDG_STATE_HOME=/tmp/nvs XDG_CACHE_HOME=/tmp/nvc nvim --headless "+Lazy! sync" +qa; rm -rf /tmp/nvs /tmp/nvc; test -d /etc/skel/.local/share/nvim/lazy/LazyVim
 echo "Glacier image configuration complete"

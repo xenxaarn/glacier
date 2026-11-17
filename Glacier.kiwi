@@ -76,6 +76,12 @@
 		<package name="loupe"/>
 		<package name="kitty"/>
 		<package name="neovim"/>
+		<package name="ripgrep"/>
+		<package name="fd-find"/>
+		<package name="fzf"/>
+		<package name="lazygit"/>
+		<package name="tree-sitter-cli"/>
+		<package name="wl-clipboard"/>
 		<package name="gnome-disk-utility"/>
 		<package name="vlc"/>
 		<package name="vlc-plugin-ffmpeg"/>
