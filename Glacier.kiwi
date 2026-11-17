@@ -114,7 +114,7 @@
 		<package name="systemd-resolved"/>
 		<package name="dracut-config-rescue"/>
     <package name="dnf5-plugins"/>
-    <package name="dnf5-plugins"/>
+	<package name="sudo"/>
 		<package name="bash-completion"/>
 		<package name="tar"/>
 		<package name="unzip"/>
