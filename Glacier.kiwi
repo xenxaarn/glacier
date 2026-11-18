@@ -137,6 +137,8 @@
 		<package name="python3-pip"/>
 		<package name="python3-devel"/>
 		<package name="git"/>
+		<package name="dkms"/>
+		<package name="kernel-devel-matched"/>
 		<package name="curl"/>
 		<package name="wget1-wget"/>
 		<package name="kernel-core"/>

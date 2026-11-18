@@ -70,6 +70,14 @@ systemctl enable \
   flatpaks
 systemctl set-default graphical.target
 
+git clone --depth 1 https://github.com/Mange/rtl8192eu-linux-driver.git /usr/src/rtl8192eu-1.0
+KVER=$(ls /lib/modules | sort -V | tail -1)
+dkms add -m rtl8192eu -v 1.0
+dkms install -m rtl8192eu -v 1.0 -k "$KVER"
+dkms status
+echo "blacklist rtl8xxxu" >/etc/modprobe.d/rtl8xxxu.conf
+echo 8192eu >/etc/modules-load.d/8192eu.conf
+
 rm -f /etc/machine-id
 echo 'uninitialized' >/etc/machine-id
 rm -f /var/lib/systemd/random-seed
