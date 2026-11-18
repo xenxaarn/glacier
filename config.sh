@@ -52,7 +52,7 @@ fi
 
 # Icons script
 git clone --depth 1 https://github.com/xenxaarn/omapixicon.git /opt/omapixicon
-python3 /opt/omapixicon/engine/render.py --out /usr/share/icons/OmaPixIcon
+python3 /opt/omapixicon/engine/render.py --out /usr/share/icons/OmaPixIcon --inherits Adwaita,hicolor
 rm -rf /opt/omapixicon
 printf "[org/gnome/desktop/interface]\nicon-theme='OmaPixIcon'\n" >/etc/dconf/db/local.d/02-icons
 
@@ -60,12 +60,14 @@ if command -v dconf >/dev/null 2>&1; then
   dconf update
 fi
 
+firewall-offline-cmd --add-service=kdeconnect || echo "WARN: kdeconnect firewall rule not applied"
 systemctl enable \
   gdm \
   NetworkManager \
   bluetooth \
   power-profiles-daemon \
-  firewalld
+  firewalld \
+  flatpaks
 systemctl set-default graphical.target
 
 rm -f /etc/machine-id
