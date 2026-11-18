@@ -23,4 +23,4 @@ tap-to-click=true
 exec='kitty'
 
 [org/gnome/shell]
-favorite-apps=['org.gnome.Settings.desktop', 'firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'kitty.desktop', 'md.obsidian.Obsidian.desktop']
+favorite-apps=['org.gnome.Settings.desktop', 'firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'kitty.desktop', 'com.discordapp.Discord.desktop', 'org.kde.marknote.desktop']

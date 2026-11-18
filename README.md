@@ -13,8 +13,8 @@ for a standard mutable Fedora system (`dnf5` + Flatpak).
 - Hybrid UEFI + BIOS Live ISO with `erofs` squashfs root
 - Anaconda installer for disk installation
 - Dark GNOME desktop: `adw-gtk3-dark`, Inter 11, JetBrains Mono 11
-- Kitty terminal, pinned dock, GNOME Shell extensions (blur-my-shell, RunCat, Caffeine)
-- Flathub + Obsidian installed on first boot
+- Kitty terminal, pinned dock, GNOME Shell extensions (blur-my-shell, RunCat, Clipboard History, Caffeine, Dock to Panel, GSConnect)
+- Flathub apps are installed on first boot
 
 ## Apps & Tools
 

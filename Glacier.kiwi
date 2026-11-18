@@ -83,6 +83,8 @@
 		<package name="tree-sitter-cli"/>
 		<package name="wl-clipboard"/>
 		<package name="gnome-disk-utility"/>
+    <package name="gnome-calculator"/>
+    <package name="marknote"/>
 		<package name="vlc"/>
 		<package name="vlc-plugin-ffmpeg"/>
 		<package name="btop"/>
@@ -114,7 +116,7 @@
 		<package name="systemd-resolved"/>
 		<package name="dracut-config-rescue"/>
     <package name="dnf5-plugins"/>
-	<package name="sudo"/>
+	  <package name="sudo"/>
 		<package name="bash-completion"/>
 		<package name="tar"/>
 		<package name="unzip"/>
