@@ -6,6 +6,9 @@
 		<contact>xenxaarn</contact>
 		<specification>Glacier OS, a minimal dark GNOME desktop on Fedora, built with KIWI NG</specification>
 	</description>
+	<profiles>
+		<profile name="dev" description="Developer toolchain: clang, gdb, lldb, valgrind, cmake, ninja"/>
+	</profiles>
 	<preferences>
 		<version>45</version>
 		<packagemanager>dnf5</packagemanager>
@@ -83,8 +86,8 @@
 		<package name="tree-sitter-cli"/>
 		<package name="wl-clipboard"/>
 		<package name="gnome-disk-utility"/>
-    <package name="gnome-calculator"/>
-    <package name="marknote"/>
+		<package name="gnome-calculator"/>
+		<package name="marknote"/>
 		<package name="vlc"/>
 		<package name="vlc-plugin-ffmpeg"/>
 		<package name="btop"/>
@@ -115,33 +118,34 @@
 		<package name="systemd-oomd-defaults"/>
 		<package name="systemd-resolved"/>
 		<package name="dracut-config-rescue"/>
-    <package name="dnf5-plugins"/>
-	  <package name="sudo"/>
+		<package name="dnf5-plugins"/>
+		<package name="sudo"/>
 		<package name="bash-completion"/>
 		<package name="tar"/>
 		<package name="unzip"/>
 		<ignore name="kernel-*debug*"/>
 		<package name="gcc"/>
+		<package name="make"/>
+		<package name="python3"/>
+		<package name="git"/>
+		<package name="curl"/>
+		<package name="wget1-wget"/>
+		<package name="kernel-core"/>
+	</packages>
+
+	<packages type="image" profiles="dev" patternType="onlyRequired">
 		<package name="gcc-c++"/>
 		<package name="clang"/>
 		<package name="clang-tools-extra"/>
 		<package name="cmake"/>
 		<package name="ninja-build"/>
-		<package name="make"/>
 		<package name="gdb"/>
 		<package name="lldb"/>
 		<package name="valgrind"/>
 		<package name="pkgconf-pkg-config"/>
 		<package name="openssl-devel"/>
-		<package name="python3"/>
 		<package name="python3-pip"/>
 		<package name="python3-devel"/>
-		<package name="git"/>
-		<package name="dkms"/>
-		<package name="kernel-devel-matched"/>
-		<package name="curl"/>
-		<package name="wget1-wget"/>
-		<package name="kernel-core"/>
 	</packages>
 
 	<packages type="iso" patternType="onlyRequired">

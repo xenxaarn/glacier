@@ -1,6 +1,6 @@
 # Glacier GRUB ISO boot template. Placeholders are filled by KIWI NG at build time.
 
-set default="1"
+set default="0"
 
 if [ "$$grub_platform" == "efi" ]; then
 	function load_video {

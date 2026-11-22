@@ -1,0 +1,20 @@
+#!/bin/bash
+# Re-apply Glacier branding; fedora-release upgrades overwrite os-release. Idempotent.
+set -euo pipefail
+
+file="${OS_RELEASE:-/usr/lib/os-release}"
+name='NAME="Glacier"'
+pretty='PRETTY_NAME="Glacier"'
+
+if grep -qxF "$name" "$file" && grep -qxF "$pretty" "$file"; then
+  exit 0
+fi
+
+sed -i \
+  -e "s/^NAME=.*/$name/" \
+  -e "s/^PRETTY_NAME=.*/$pretty/" \
+  "$file"
+
+if command -v restorecon >/dev/null 2>&1; then
+  restorecon "$file" || true
+fi

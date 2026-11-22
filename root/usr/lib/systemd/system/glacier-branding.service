@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply Glacier os-release branding
+ConditionPathExists=/usr/lib/os-release
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/glacier-branding
+
+[Install]
+WantedBy=multi-user.target

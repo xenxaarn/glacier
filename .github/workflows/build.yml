@@ -3,57 +3,124 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
     paths-ignore: ['**.md', 'images/**']
   pull_request:
   schedule:
     - cron: '0 4 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
-  iso:
+  lint:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Podman
+      - name: Install KIWI NG (schema validation only)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman
-          echo "UG=$(id -u):$(id -g)" >> "$GITHUB_ENV"
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet kiwi==11.1.19
 
-      - name: Build Glacier ISO with KIWI NG
+      - name: Lint
+        run: PATH="$PWD/.venv/bin:$PATH" ./tools/lint.sh
+
+  iso:
+    needs: lint
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: minimal
+            profile: ''
+          - variant: dev
+            profile: dev
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Make sure Podman is available
+        run: command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+
+      - name: Build ISO (${{ matrix.variant }})
+        env:
+          PROFILE: ${{ matrix.profile }}
         run: |
-          mkdir -p output
-          sudo podman run --rm --privileged --network=host \
-            --security-opt label=type:unconfined_t \
-            -v "$PWD:$PWD" -v "$PWD/output:$PWD/output" -w "$PWD" \
-            --pull=newer \
-            registry.fedoraproject.org/fedora:45 \
-            bash -c "
-              set -euxo pipefail
-              mkdir -p output/kiwi-tmp
-              dnf install -y --setopt=install_weak_deps=False \
-                kiwi kiwi-systemdeps-iso-media distribution-gpg-keys
-              dnf clean all
-              kiwi-ng --temp-dir output/kiwi-tmp system build --description . --target-dir output
-            "
+          sudo mkdir -p /mnt/glacier-out
+          sudo --preserve-env=PROFILE ./build.sh --output /mnt/glacier-out
 
-      - name: Generate checksums
+      - name: Stage ISO and checksum
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          out=/mnt/glacier-out
+          iso=$(find "$out" -maxdepth 3 -name '*.iso' | head -n1)
+          test -n "$iso" || { echo "::error::no ISO produced"; exit 1; }
+          mkdir -p "$out/dist"
+          mv "$iso" "$out/dist/Glacier-$VARIANT-x86_64.iso"
+          cd "$out/dist"
+          sha256sum Glacier-*.iso | tee "SHA256SUMS-$VARIANT"
+          ls -lh
+
+      - name: Upload ISO
         if: github.event_name != 'pull_request'
-        run: |
-          cd output
-          find . -maxdepth 3 -name '*.iso' -print0 | xargs -0 sha256sum > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Upload ISO artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: glacier-iso
-          path: |
-            output/*.iso
-            output/SHA256SUMS
+          name: glacier-iso-${{ matrix.variant }}
+          path: /mnt/glacier-out/dist/*
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: iso
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: glacier-iso-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums and size check
+        working-directory: dist
+        run: |
+          rm -f SHA256SUMS-*
+          for f in *.iso; do
+            size=$(stat -c %s "$f")
+            if [ "$size" -ge 2147483648 ]; then
+              echo "::error::$f is $size bytes; GitHub release assets are limited to 2 GiB"
+              exit 1
+            fi
+          done
+          sha256sum -- *.iso | tee SHA256SUMS
+
+      - name: Sign checksums (optional, needs GPG_PRIVATE_KEY secret)
+        if: env.GPG_KEY != ''
+        working-directory: dist
+        run: |
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --armor --detach-sign SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Glacier $GITHUB_REF_NAME" \
+            --generate-notes \
+            --draft

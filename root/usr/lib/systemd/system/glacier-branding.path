@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-apply Glacier branding when os-release is replaced by a package upgrade
+
+[Path]
+PathChanged=/usr/lib/os-release
+
+[Install]
+WantedBy=paths.target

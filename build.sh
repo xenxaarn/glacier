@@ -3,66 +3,80 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PROFILE="${PROFILE:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
-CONTAINER_IMAGE="registry.fedoraproject.org/fedora:45"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-registry.fedoraproject.org/fedora:45}"
 BOX="${BOX:-}"
+PROFILES="${PROFILE:-}"
+MODE="container"
 
 usage() {
-	cat <<EOF
-Usage: $0 [--native] [--boxbuild] [--profile <profile>] [--output <dir>] [--box <name>]
+	cat <<USAGE
+Usage: $0 [--native] [--boxbuild] [--profile <a[,b]>] [--output <dir>] [--box <n>]
 
   (no flag)   Build inside a privileged Fedora 45 container (Podman/Docker).
-  --native    Build directly on a Fedora 45 host.
-  --boxbuild  Build in a self-contained KIWI box (needs a configured --box).
+  --native    Build directly on a Fedora 45 host (needs root).
+  --boxbuild  Build in a self-contained KIWI box (needs root and --box).
 
-  --profile   Optional KIWI profile name.
+  --profile   KIWI profile(s), comma separated or repeated. Default: none
+              (minimal image). Available: dev (developer toolchain).
   --output    Directory for build artefacts (default: output).
   --box       Box name for --boxbuild (see 'kiwi-ng system boxbuild --list-boxes').
-EOF
-	exit 0
+USAGE
+	exit "${1:-0}"
 }
 
-MODE="container"
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--native)    MODE="native" ;;
 		--boxbuild)  MODE="boxbuild" ;;
-		--profile)   PROFILE="$2"; shift ;;
-		--output)    OUTPUT_DIR="$2"; shift ;;
-		--box)       BOX="$2"; shift ;;
-		-h|--help)   usage ;;
-		*) echo "Unknown option: $1" >&2; usage ;;
+		--profile)   PROFILES="${PROFILES:+$PROFILES,}${2:?--profile needs a value}"; shift ;;
+		--output)    OUTPUT_DIR="${2:?--output needs a value}"; shift ;;
+		--box)       BOX="${2:?--box needs a value}"; shift ;;
+		-h|--help)   usage 0 ;;
+		*) echo "Unknown option: $1" >&2; usage 1 ;;
 	esac
 	shift
 done
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR/kiwi-tmp"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 PROFILE_ARGS=()
-if [ -n "$PROFILE" ]; then
-	PROFILE_ARGS=(--profile "$PROFILE")
-fi
+IFS=',' read -r -a profile_list <<<"$PROFILES"
+for p in ${profile_list[@]+"${profile_list[@]}"}; do
+	if [ -n "$p" ]; then
+		PROFILE_ARGS+=(--profile "$p")
+	fi
+done
 
-if [ "$MODE" = "native" ]; then
+require_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "ERROR: $1 needs root; re-run with sudo." >&2
+		exit 1
+	fi
+}
+
+require_kiwi() {
 	if ! command -v kiwi-ng >/dev/null 2>&1; then
 		echo "ERROR: kiwi-ng not found. Install KIWI NG on a Fedora 45 host:" >&2
 		echo "  sudo dnf install kiwi kiwi-systemdeps-iso-media distribution-gpg-keys" >&2
 		exit 1
 	fi
+}
+
+if [ "$MODE" = "native" ]; then
+	require_root --native
+	require_kiwi
 	echo "==> Building natively"
 	kiwi-ng ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} --temp-dir "$OUTPUT_DIR/kiwi-tmp" system build \
 		--description . \
 		--target-dir "$OUTPUT_DIR"
 
 elif [ "$MODE" = "boxbuild" ]; then
-	if ! command -v kiwi-ng >/dev/null 2>&1; then
-		echo "ERROR: kiwi-ng not found. Install KIWI NG first:" >&2
-		echo "  sudo dnf install kiwi kiwi-systemdeps-iso-media distribution-gpg-keys" >&2
-		exit 1
-	fi
+	require_root --boxbuild
+	require_kiwi
 	if [ -z "$BOX" ]; then
-		echo "ERROR: --boxbuild requires --box <name>." >&2
+		echo "ERROR: --boxbuild requires --box <n>." >&2
 		echo "List available boxes with: kiwi-ng system boxbuild --list-boxes" >&2
 		exit 1
 	fi
@@ -75,24 +89,32 @@ elif [ "$MODE" = "boxbuild" ]; then
 
 else
 	if command -v podman >/dev/null 2>&1; then
-		RUNNER=(podman run --rm --privileged --network=host)
-		RUNNER+=(-v "$PWD/$OUTPUT_DIR:$PWD/$OUTPUT_DIR" -v "$PWD:$PWD" -w "$PWD")
-		RUNNER+=(--pull=newer --security-opt label=type:unconfined_t)
+		RUNNER=(podman run --rm --privileged --network=host --pull=newer)
 	elif command -v docker >/dev/null 2>&1; then
-		RUNNER=(docker run --rm --privileged --network=host)
-		RUNNER+=(-v "$PWD/$OUTPUT_DIR:$PWD/$OUTPUT_DIR" -v "$PWD:$PWD" -w "$PWD")
-		RUNNER+=(--pull always --security-opt label=type:unconfined_t)
+		RUNNER=(docker run --rm --privileged --network=host --pull always)
 	else
 		echo "ERROR: neither podman nor docker found. Install one to build." >&2
 		exit 1
 	fi
+	RUNNER+=(--security-opt label=type:unconfined_t)
+	RUNNER+=(-v "$PWD:$PWD" -v "$OUTPUT_DIR:$OUTPUT_DIR" -w "$PWD")
 
-	echo "==> Building inside privileged Fedora 45 container"
+	OWNER="${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}"
+
+	echo "==> Building inside privileged container ($CONTAINER_IMAGE)"
 	"${RUNNER[@]}" "$CONTAINER_IMAGE" \
-		bash -c "mkdir -p '$OUTPUT_DIR/kiwi-tmp' && dnf install -y --setopt=install_weak_deps=False kiwi kiwi-systemdeps-iso-media distribution-gpg-keys && dnf clean all && \
-			kiwi-ng ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} --temp-dir '$OUTPUT_DIR/kiwi-tmp' system build --description '.' --target-dir '$OUTPUT_DIR'"
+		bash "$PWD/tools/container-build.sh" "$OUTPUT_DIR" "$OWNER" \
+		${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
 fi
 
 echo
-echo "==> Build complete. ISO(s) in: $OUTPUT_DIR"
-find "$OUTPUT_DIR" -maxdepth 3 -type f \( -name '*.iso' -o -name 'SHA256SUMS' \) -exec ls -lh {} \;
+(
+	cd "$OUTPUT_DIR"
+	find . -maxdepth 3 -type f -name '*.iso' -printf '%P\0' | sort -z | xargs -0 -r sha256sum >SHA256SUMS
+	if [ ! -s SHA256SUMS ]; then
+		echo "ERROR: build finished but no ISO was produced." >&2
+		exit 1
+	fi
+	echo "==> Build complete. Output in: $OUTPUT_DIR"
+	find . -maxdepth 3 -type f \( -name '*.iso' -o -name SHA256SUMS \) -exec ls -lh {} \;
+)

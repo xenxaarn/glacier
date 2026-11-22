@@ -5,39 +5,42 @@ set -euxo pipefail
 test -f /.kconfig && . /.kconfig
 test -f /.profile && . /.profile
 
+: "${kiwi_iname:=Glacier}"
 echo "Configure image: [$kiwi_iname]..."
 
-sed -i \
-  -e 's/^NAME=.*/NAME="Glacier"/' \
-  -e 's/^PRETTY_NAME=.*/PRETTY_NAME="Glacier"/' \
-  /usr/lib/os-release
+/usr/libexec/glacier-branding
 
 EXT_LIST="/usr/share/glacier/extensions.txt"
 if [ -f "$EXT_LIST" ]; then
   gnome_shell_version=$(rpm -q --qf '%{VERSION}' gnome-shell)
   gnome_shell_major=${gnome_shell_version%%.*}
   ext_dir=/usr/share/gnome-shell/extensions
+  tmp_dir=$(mktemp -d)
   installed_list=""
 
   while read -r uuid; do
     case "$uuid" in
     '' | '#'*) continue ;;
     esac
-    info=$(curl -sS "https://extensions.gnome.org/extension-info/?uuid=$uuid&shell_version=$gnome_shell_major" 2>/dev/null || true)
-    dl_url=$(printf '%s' "$info" | python3 -c \
-      'import sys,json
-s=sys.stdin.read()
-print(json.loads(s).get("download_url","") if s.lstrip().startswith("{") else "")' 2>/dev/null || true)
 
+    # Fetch errors abort the build.
+    code=$(curl -sS --retry 3 --retry-delay 2 -o "$tmp_dir/info.json" -w '%{http_code}' \
+      "https://extensions.gnome.org/extension-info/?uuid=$uuid&shell_version=$gnome_shell_major")
+    if [ "$code" != 200 ]; then
+      echo "ERROR: extensions.gnome.org returned HTTP $code for $uuid" >&2
+      exit 1
+    fi
+    dl_url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("download_url",""))' "$tmp_dir/info.json")
     if [ -z "$dl_url" ]; then
-      echo "SKIP $uuid: no build for shell $gnome_shell_major or offline"
+      echo "WARN: $uuid has no build for GNOME Shell $gnome_shell_major, skipping" >&2
       continue
     fi
 
-    curl -fsSL -o /tmp/glacier-ext.zip "https://extensions.gnome.org$dl_url" &&
-      python3 -m zipfile -e /tmp/glacier-ext.zip "$ext_dir/$uuid" &&
-      [ -d "$ext_dir/$uuid/schemas" ] &&
+    curl -fsSL --retry 3 --retry-delay 2 -o "$tmp_dir/ext.zip" "https://extensions.gnome.org$dl_url"
+    python3 -m zipfile -e "$tmp_dir/ext.zip" "$ext_dir/$uuid"
+    if [ -d "$ext_dir/$uuid/schemas" ]; then
       glib-compile-schemas "$ext_dir/$uuid/schemas"
+    fi
 
     installed_list="${installed_list:+$installed_list, }'$uuid'"
   done <"$EXT_LIST"
@@ -47,11 +50,13 @@ print(json.loads(s).get("download_url","") if s.lstrip().startswith("{") else ""
     printf '[org/gnome/shell]\nenabled-extensions=[%s]\n' "$installed_list" \
       >/etc/dconf/db/local.d/01-extensions
   fi
-  rm -f /tmp/glacier-ext.zip
+  rm -rf "$tmp_dir"
 fi
 
-# Icons script
-git clone --depth 1 https://github.com/xenxaarn/omapixicon.git /opt/omapixicon
+OMAPIXICON_REV=2db7f6f069a526c101e5d87c7d92c40b77d5ffe7
+git init -q /opt/omapixicon
+git -C /opt/omapixicon fetch -q --depth 1 https://github.com/xenxaarn/omapixicon.git "$OMAPIXICON_REV"
+git -C /opt/omapixicon checkout -q FETCH_HEAD
 python3 /opt/omapixicon/engine/render.py --out /usr/share/icons/OmaPixIcon --inherits Adwaita,hicolor
 rm -rf /opt/omapixicon
 printf "[org/gnome/desktop/interface]\nicon-theme='OmaPixIcon'\n" >/etc/dconf/db/local.d/02-icons
@@ -67,16 +72,10 @@ systemctl enable \
   bluetooth \
   power-profiles-daemon \
   firewalld \
-  flatpaks
+  flatpaks \
+  glacier-branding.service \
+  glacier-branding.path
 systemctl set-default graphical.target
-
-git clone --depth 1 https://github.com/Mange/rtl8192eu-linux-driver.git /usr/src/rtl8192eu-1.0
-KVER=$(ls /lib/modules | sort -V | tail -1)
-dkms add -m rtl8192eu -v 1.0
-dkms install -m rtl8192eu -v 1.0 -k "$KVER"
-dkms status
-echo "blacklist rtl8xxxu" >/etc/modprobe.d/rtl8xxxu.conf
-echo 8192eu >/etc/modules-load.d/8192eu.conf
 
 rm -f /etc/machine-id
 echo 'uninitialized' >/etc/machine-id
@@ -93,7 +92,12 @@ touch /var/lib/rpm/.updated
 touch /var/lib/rpm/.rpmdb
 
 ln -sf /usr/bin/nvim /usr/local/bin/neovim
-XDG_CONFIG_HOME=/etc/skel/.config XDG_DATA_HOME=/etc/skel/.local/share XDG_STATE_HOME=/tmp/nvs XDG_CACHE_HOME=/tmp/nvc nvim --headless "+Lazy! sync" +qa
+if [ -f /etc/skel/.config/nvim/lazy-lock.json ]; then
+  lazy_cmd="Lazy! restore"
+else
+  lazy_cmd="Lazy! sync"
+fi
+XDG_CONFIG_HOME=/etc/skel/.config XDG_DATA_HOME=/etc/skel/.local/share XDG_STATE_HOME=/tmp/nvs XDG_CACHE_HOME=/tmp/nvc nvim --headless "+$lazy_cmd" +qa
 rm -rf /tmp/nvs /tmp/nvc
 test -d /etc/skel/.local/share/nvim/lazy/LazyVim
 echo "Glacier image configuration complete"
