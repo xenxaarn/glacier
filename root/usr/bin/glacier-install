@@ -60,7 +60,7 @@ chr() { chroot "$TARGET" "$@"; }
 step() {
   local title=$1 fn=$2
   STEP=$((STEP + 1))
-  export -f "$fn"
+  declare -fx "$fn"
   gum spin --spinner dot --show-error --title "[$STEP/$TOTAL] $title" -- \
     bash -c "set -Eeuo pipefail; $fn"
 }
