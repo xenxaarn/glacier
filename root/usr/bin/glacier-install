@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# glacier-install: terminal installer for the Glacier live ISO.
+#
+# Layout (UEFI only):
+#   p1  512 MiB  ESP    FAT32       /boot/efi
+#   p2    1 GiB  /boot  ext4        /boot
+#   p3   rest    LUKS2 -> Btrfs     @ -> /, @home -> /home
+#
+# The installed system is an rsync copy of the pristine live image
+# (/run/rootfsbase), so none of the live-session state (liveuser, autologin,
+# autostart entries) is carried over. Needs: gum sgdisk cryptsetup rsync
+# mkfs.{fat,ext4,btrfs} efibootmgr grub2-tools.
+#
+# Dev override: GLACIER_SRC=/some/rootfs uses that tree as the copy source.
+# Log: /tmp/glacier-installer.log
+
+set -Eeuo pipefail
+
+readonly TARGET=/mnt
+readonly CRYPT=cryptroot
+readonly LOG=/tmp/glacier-installer.log
+readonly MIN_DISK_GIB=16
+readonly MIN_PASS_LEN=8
+
+DISK=""
+NEW_HOSTNAME="glacier"
+NEW_USER=""
+USER_PASS=""
+LUKS_PASS=""
+TZ_NAME="UTC"
+KB_LAYOUT="us"
+
+P_ESP="" P_BOOT="" P_LUKS=""
+LUKS_UUID="" BTRFS_UUID="" BOOT_UUID="" ESP_UUID=""
+CMDLINE=""
+SRC=""
+SRC_MOUNTED=0
+CRYPT_OPEN=0
+STEP=0
+TOTAL=5
+
+# ---------------------------------------------------------------- helpers
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+# Run a command with all output going to the log; on failure say which one.
+run() {
+  "$@" >>"$LOG" 2>&1 || {
+    echo "failed: $*" >&2
+    return 1
+  }
+}
+
+# Run a command inside the target root.
+chr() { chroot "$TARGET" "$@"; }
+
+step() {
+  local title=$1 fn=$2
+  STEP=$((STEP + 1))
+  export -f "$fn"
+  gum spin --spinner dot --show-error --title "[$STEP/$TOTAL] $title" -- \
+    bash -c "set -Eeuo pipefail; $fn"
+}
+
+part_path() { # part_path /dev/nvme0n1 2 -> /dev/nvme0n1p2, /dev/sda 2 -> /dev/sda2
+  if [[ $1 =~ [0-9]$ ]]; then echo "${1}p${2}"; else echo "${1}${2}"; fi
+}
+
+valid_hostname() {
+  [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+valid_username() {
+  [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && ! getent passwd "$1" >/dev/null
+}
+
+# Disks that back the running live media (including the parents of loop and
+# mapper devices).
+live_disks() {
+  local mp src
+  for mp in /run/initramfs/live /run/initramfs/isoscan; do
+    mountpoint -q "$mp" 2>/dev/null || continue
+    src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null || true)
+    [[ $src == /dev/* ]] || continue
+    lsblk -n -s -p -r -o NAME,TYPE "$src" 2>/dev/null | awk '$2 == "disk" { print $1 }'
+  done | sort -u
+}
+
+# Installable disks as "path size model transport" lines.
+list_disks() {
+  local live d type size model tran
+  live=$(live_disks)
+  while read -r d type; do
+    [[ $type == disk ]] || continue
+    case $d in /dev/loop* | /dev/zram* | /dev/sr* | /dev/ram* | /dev/fd*) continue ;; esac
+    grep -qxF "$d" <<<"$live" && continue
+    [[ $(lsblk -dn -o RO "$d") == 0 ]] || continue
+    size=$(lsblk -bdn -o SIZE "$d")
+    ((size >= MIN_DISK_GIB * 1024 ** 3)) || continue
+    model=$(lsblk -dn -o MODEL "$d" | sed 's/[[:space:]]*$//')
+    tran=$(lsblk -dn -o TRAN "$d" | tr -d '[:space:]')
+    printf '%-16s %9s  %s [%s]\n' "$d" "$(lsblk -dn -o SIZE "$d" | tr -d '[:space:]')" \
+      "${model:-unknown model}" "${tran:-?}"
+  done < <(lsblk -d -n -p -o NAME,TYPE)
+}
+
+# ---------------------------------------------------------------- cleanup
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  if mountpoint -q "$TARGET" 2>/dev/null || findmnt -rn -R "$TARGET" >/dev/null 2>&1; then
+    umount -R "$TARGET" >/dev/null 2>&1 || umount -R -l "$TARGET" >/dev/null 2>&1
+  fi
+  if ((SRC_MOUNTED)); then umount "$SRC" >/dev/null 2>&1; fi
+  if ((CRYPT_OPEN)) && [[ -e /dev/mapper/$CRYPT ]]; then
+    udevadm settle >/dev/null 2>&1
+    cryptsetup close "$CRYPT" >/dev/null 2>&1 || {
+      sleep 1
+      cryptsetup close "$CRYPT" >/dev/null 2>&1
+    }
+  fi
+  if ((rc != 0 && rc != 130)); then
+    echo
+    echo "Installation failed (exit $rc). Last log lines:"
+    tail -n 25 "$LOG" 2>/dev/null | sed 's/^/  /'
+    echo
+    echo "Full log: $LOG"
+    if [[ -t 0 ]]; then read -r -p "Press Enter to close. " _ || true; fi
+  fi
+  exit "$rc"
+}
+
+# ---------------------------------------------------------------- preflight
+
+preflight() {
+  if ((EUID != 0)); then
+    exec sudo -n /usr/bin/glacier-install "$@"
+  fi
+  : >"$LOG"
+  ! mountpoint -q "$TARGET" || die "$TARGET is already mounted; unmount it first."
+  [[ -d /sys/firmware/efi ]] || die "UEFI firmware not detected; this installer is UEFI only."
+  command -v gum >/dev/null || die "gum is not installed."
+  local c
+  for c in sgdisk cryptsetup rsync mkfs.fat mkfs.ext4 mkfs.btrfs blkid wipefs blockdev partx \
+    udevadm lsblk findmnt chroot efibootmgr; do
+    command -v "$c" >/dev/null || die "missing required command: $c"
+  done
+}
+
+find_source() {
+  if [[ -n ${GLACIER_SRC:-} ]]; then
+    SRC=$GLACIER_SRC
+  elif mountpoint -q /run/rootfsbase; then
+    SRC=/run/rootfsbase
+  elif [[ -b /dev/mapper/live-base ]]; then
+    SRC=/run/glacier-src
+    mkdir -p "$SRC"
+    mount -o ro /dev/mapper/live-base "$SRC"
+    SRC_MOUNTED=1
+  else
+    die "can't find the pristine live image (/run/rootfsbase). Is this the Glacier live ISO?"
+  fi
+  [[ -d $SRC/usr/lib/modules ]] || die "copy source $SRC has no /usr/lib/modules"
+}
+
+# ---------------------------------------------------------------- prompts
+
+fail_msg() { gum style --foreground 196 "$*"; }
+
+ask_password() { # ask_password "label" -> echoes password
+  local p1 p2
+  while true; do
+    p1=$(gum input --password --header "$1" --placeholder "min $MIN_PASS_LEN characters")
+    p2=$(gum input --password --header "Confirm: $1" --placeholder "repeat it")
+    if ((${#p1} < MIN_PASS_LEN)); then
+      fail_msg "Too short (min $MIN_PASS_LEN characters)." >&2
+    elif [[ $p1 != "$p2" ]]; then
+      fail_msg "Doesn't match." >&2
+    else
+      printf '%s' "$p1"
+      return
+    fi
+  done
+}
+
+prompts() {
+  clear
+  gum style --border rounded --border-foreground 39 --padding "1 3" --margin "1 0" --bold \
+    "Glacier installer" "UEFI · LUKS2 · Btrfs"
+
+  local choice
+  choice=$(gum choose --header "What now?" "Install Glacier to disk" "Exit to live desktop") || exit 0
+  [[ $choice == "Install Glacier to disk" ]] || exit 0
+
+  # Disk
+  local disks line
+  disks=$(list_disks)
+  [[ -n $disks ]] || die "no usable disk found (need >= ${MIN_DISK_GIB} GiB, not the live USB)."
+  line=$(gum choose --header "Target disk (everything on it will be erased)" <<<"$disks") || exit 0
+  DISK=${line%% *}
+
+  # Hostname
+  while true; do
+    NEW_HOSTNAME=$(gum input --header "Hostname" --value "glacier")
+    if valid_hostname "$NEW_HOSTNAME"; then break; fi
+    fail_msg "Lowercase letters, digits and '-', max 63 chars, no leading/trailing '-'."
+  done
+
+  # User
+  while true; do
+    NEW_USER=$(gum input --header "Username (gets sudo)" --placeholder "username")
+    if valid_username "$NEW_USER"; then break; fi
+    fail_msg "Invalid or taken. Use lowercase letters, digits, '_' and '-', starting with a letter."
+  done
+  USER_PASS=$(ask_password "Password for $NEW_USER")
+
+  # Disk encryption
+  if gum confirm --default=true "Use the same password to encrypt the disk?"; then
+    LUKS_PASS=$USER_PASS
+  else
+    LUKS_PASS=$(ask_password "Disk encryption passphrase")
+  fi
+
+  # Timezone
+  local tz_guess
+  tz_guess=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+  tz_guess=${tz_guess:-UTC}
+  if gum confirm --default=true "Timezone: $tz_guess?"; then
+    TZ_NAME=$tz_guess
+  else
+    TZ_NAME=$(timedatectl list-timezones | gum filter --header "Timezone" --placeholder "type to search") || exit 0
+  fi
+
+  # Keyboard
+  local kb_guess
+  kb_guess=$(localectl status 2>/dev/null | awk '/X11 Layout/ { print $3 }')
+  kb_guess=${kb_guess:-us}
+  if gum confirm --default=true "Keyboard layout: $kb_guess?"; then
+    KB_LAYOUT=$kb_guess
+  else
+    KB_LAYOUT=$(localectl list-x11-keymap-layouts | gum filter --header "Keyboard layout" --placeholder "type to search") || exit 0
+  fi
+
+  # Final confirmation, with the exact device.
+  local model size
+  model=$(lsblk -dn -o MODEL "$DISK" | sed 's/[[:space:]]*$//')
+  size=$(lsblk -dn -o SIZE "$DISK" | tr -d '[:space:]')
+  gum style --border rounded --border-foreground 196 --padding "1 3" --margin "1 0" \
+    "ERASE $DISK" "${size}  ${model:-unknown model}" "" \
+    "user: $NEW_USER    host: $NEW_HOSTNAME" "tz: $TZ_NAME    keyboard: $KB_LAYOUT"
+  gum confirm --default=false --affirmative "Erase and install" --negative "Cancel" \
+    "This destroys all data on $DISK. Continue?" || {
+    echo "Cancelled."
+    exit 0
+  }
+}
+
+# ---------------------------------------------------------------- install steps
+
+s_partition() {
+  local n type
+  while read -r n type; do
+    case $type in
+    disk | part)
+      swapoff "$n" 2>/dev/null || true
+      umount -l "$n" 2>/dev/null || true
+      ;;
+    crypt | lvm) dmsetup remove --retry "$n" 2>/dev/null || true ;;
+    esac
+  done < <(lsblk -n -p -l -o NAME,TYPE "$DISK" | tac)
+  run wipefs -af "$DISK"
+  run sgdisk --zap-all "$DISK"
+  run sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System" "$DISK"
+  run sgdisk -n 2:0:+1024M -t 2:8300 -c 2:"Glacier boot" "$DISK"
+  run sgdisk -n 3:0:0 -t 3:8309 -c 3:"Glacier LUKS" "$DISK"
+  blockdev --rereadpt "$DISK" >>"$LOG" 2>&1 || true
+  partx -a "$DISK" >>"$LOG" 2>&1 || true
+  run udevadm settle
+  local _
+  for _ in {1..50}; do
+    [[ -b $P_ESP && -b $P_BOOT && -b $P_LUKS ]] && return 0
+    sleep 0.2
+  done
+  echo "partition device nodes did not appear" >&2
+  return 1
+}
+
+s_format() {
+  run mkfs.fat -F32 -n EFI "$P_ESP"
+  run mkfs.ext4 -F -q -L glacier_boot "$P_BOOT"
+
+  printf '%s' "$LUKS_PASS" | run cryptsetup luksFormat --type luks2 --pbkdf argon2id \
+    --iter-time 1000 --batch-mode --key-file=- "$P_LUKS"
+  printf '%s' "$LUKS_PASS" | run cryptsetup open --allow-discards --key-file=- "$P_LUKS" "$CRYPT"
+
+  run mkfs.btrfs -f -L glacier_root "/dev/mapper/$CRYPT"
+  run mount "/dev/mapper/$CRYPT" "$TARGET"
+  run btrfs subvolume create "$TARGET/@"
+  run btrfs subvolume create "$TARGET/@home"
+  run umount "$TARGET"
+
+  local opts=compress=zstd:1,noatime
+  run mount -o "subvol=@,$opts" "/dev/mapper/$CRYPT" "$TARGET"
+  mkdir -p "$TARGET/home" "$TARGET/boot"
+  run mount -o "subvol=@home,$opts" "/dev/mapper/$CRYPT" "$TARGET/home"
+  run mount "$P_BOOT" "$TARGET/boot"
+  mkdir -p "$TARGET/boot/efi"
+  run mount "$P_ESP" "$TARGET/boot/efi"
+}
+
+copy_system() {
+  local rc=0
+  rsync -aAXH --numeric-ids -x --no-inc-recursive --info=progress2 \
+    --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='/run/*' \
+    --exclude='/tmp/*' --exclude='/var/tmp/*' --exclude='/mnt/*' --exclude='/media/*' \
+    --exclude='/lost+found' --exclude='/etc/machine-id' --exclude='/etc/fstab' \
+    --exclude='/boot/loader' --exclude='/boot/initramfs-*' --exclude='/boot/vmlinuz-*' \
+    --exclude='/boot/grub2/grub.cfg' --exclude='/boot/efi' \
+    "$SRC/" "$TARGET/" 2>>"$LOG" || rc=$?
+  ((rc == 0 || rc == 24)) || die "rsync failed (exit $rc), see $LOG"
+
+  if [[ -d $SRC/boot/efi ]]; then
+    rc=0
+    rsync -rltD --no-perms --no-owner --no-group --modify-window=2 \
+      --exclude='/EFI/fedora/grub.cfg' \
+      "$SRC/boot/efi/" "$TARGET/boot/efi/" 2>>"$LOG" || rc=$?
+    ((rc == 0 || rc == 24)) || die "ESP copy failed (exit $rc), see $LOG"
+  fi
+}
+
+s_configure() {
+  local mp
+  # Hostname, locale, time, keyboard.
+  echo "$NEW_HOSTNAME" >"$TARGET/etc/hostname"
+  if [[ -e $TARGET/usr/share/zoneinfo/$TZ_NAME ]]; then
+    ln -sf "../usr/share/zoneinfo/$TZ_NAME" "$TARGET/etc/localtime"
+  else
+    echo "warning: timezone $TZ_NAME not found in target, leaving default" >>"$LOG"
+  fi
+  [[ -s $TARGET/etc/locale.conf ]] || echo "LANG=en_US.UTF-8" >"$TARGET/etc/locale.conf"
+  local console_map=us
+  localectl list-keymaps 2>/dev/null | grep -qx "$KB_LAYOUT" && console_map=$KB_LAYOUT
+  echo "KEYMAP=$console_map" >"$TARGET/etc/vconsole.conf"
+  mkdir -p "$TARGET/etc/X11/xorg.conf.d"
+  cat >"$TARGET/etc/X11/xorg.conf.d/00-keyboard.conf" <<EOF
+Section "InputClass"
+        Identifier "system-keyboard"
+        MatchIsKeyboard "on"
+        Option "XkbLayout" "$KB_LAYOUT"
+EndSection
+EOF
+
+  # fstab / crypttab
+  cat >"$TARGET/etc/fstab" <<EOF
+UUID=$BTRFS_UUID  /          btrfs  subvol=@,compress=zstd:1,noatime      0 0
+UUID=$BTRFS_UUID  /home      btrfs  subvol=@home,compress=zstd:1,noatime  0 0
+UUID=$BOOT_UUID   /boot      ext4   defaults                              1 2
+UUID=$ESP_UUID    /boot/efi  vfat   umask=0077,shortname=winnt            0 2
+EOF
+  echo "luks-$LUKS_UUID UUID=$LUKS_UUID none discard" >"$TARGET/etc/crypttab"
+  chmod 600 "$TARGET/etc/crypttab"
+
+  CMDLINE="root=UUID=$BTRFS_UUID rootflags=subvol=@ rd.luks.uuid=luks-$LUKS_UUID rhgb quiet"
+  mkdir -p "$TARGET/etc/kernel/install.d" "$TARGET/etc/dracut.conf.d" "$TARGET/etc/default"
+  echo "$CMDLINE" >"$TARGET/etc/kernel/cmdline"
+  ln -sf /dev/null "$TARGET/etc/kernel/install.d/51-dracut-rescue.install"
+  rm -f "$TARGET"/etc/dracut.conf.d/*kiwi* "$TARGET"/etc/dracut.conf.d/*live*
+  cat >"$TARGET/etc/dracut.conf.d/90-glacier-luks.conf" <<'EOF'
+hostonly="yes"
+hostonly_cmdline="no"
+add_dracutmodules+=" crypt btrfs "
+install_items+=" /etc/crypttab "
+omit_dracutmodules+=" dmsquash-live livenet "
+EOF
+  cat >"$TARGET/etc/default/grub" <<EOF
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="Glacier"
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_DISABLE_RECOVERY=true
+GRUB_TERMINAL_OUTPUT="console"
+GRUB_ENABLE_BLSCFG=true
+GRUB_CMDLINE_LINUX="$CMDLINE"
+EOF
+
+  rm -f "$TARGET/etc/machine-id"
+  run systemctl --root="$TARGET" preset-all --preset-mode=enable-only
+  for mp in dev dev/pts proc sys; do mkdir -p "$TARGET/$mp"; done
+  run mount --rbind /dev "$TARGET/dev"
+  run mount --make-rslave "$TARGET/dev"
+  run mount -t proc proc "$TARGET/proc"
+  run mount --rbind /sys "$TARGET/sys"
+  run mount --make-rslave "$TARGET/sys"
+  run chr systemd-machine-id-setup
+
+  # User.
+  run chr useradd -m -G wheel -s /bin/bash "$NEW_USER"
+  printf '%s:%s\n' "$NEW_USER" "$USER_PASS" | run chr chpasswd
+  mkdir -p "$TARGET/home/$NEW_USER/.config"
+  echo yes >"$TARGET/home/$NEW_USER/.config/gnome-initial-setup-done"
+  run chr chown "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.config" \
+    "/home/$NEW_USER/.config/gnome-initial-setup-done"
+  if [[ -f $TARGET/etc/gdm/custom.conf ]]; then
+    grep -q '^InitialSetupEnable' "$TARGET/etc/gdm/custom.conf" ||
+      sed -i '/^\[daemon\]/a InitialSetupEnable=false' "$TARGET/etc/gdm/custom.conf"
+  fi
+  rm -f "$TARGET/usr/bin/glacier-install"
+
+  # Kernel, initramfs, BLS entries.
+  local kv n_entries=0
+  for kv in "$TARGET"/usr/lib/modules/*/; do
+    kv=$(basename "$kv")
+    [[ -f $TARGET/usr/lib/modules/$kv/vmlinuz ]] || continue
+    run chr kernel-install add "$kv" "/usr/lib/modules/$kv/vmlinuz"
+  done
+  for mp in "$TARGET"/boot/loader/entries/*.conf; do
+    [[ -e $mp ]] || continue
+    sed -i "s|^options .*|options $CMDLINE|" "$mp"
+    n_entries=$((n_entries + 1))
+  done
+  ((n_entries > 0)) || {
+    echo "kernel-install produced no boot entries" >&2
+    return 1
+  }
+  compgen -G "$TARGET/boot/initramfs-*.img" >/dev/null ||
+    {
+      echo "no initramfs was generated" >&2
+      return 1
+    }
+
+  # GRUB config + the stub the signed grubx64.efi reads from the ESP.
+  mkdir -p "$TARGET/boot/grub2"
+  run chr grub2-editenv /boot/grub2/grubenv create
+  run chr grub2-mkconfig -o /boot/grub2/grub.cfg
+  [[ -f $TARGET/boot/efi/EFI/fedora/shimx64.efi ]] ||
+    {
+      echo "shimx64.efi missing from the image's ESP files" >&2
+      return 1
+    }
+  cat >"$TARGET/boot/efi/EFI/fedora/grub.cfg" <<EOF
+search --no-floppy --fs-uuid --set=dev $BOOT_UUID
+set prefix=(\$dev)/grub2
+export \$prefix
+configfile \$prefix/grub.cfg
+EOF
+  # Boot entry; the fallback path (EFI/BOOT) still works if this fails.
+  efibootmgr --create --disk "$DISK" --part 1 --label "Glacier" \
+    --loader '\EFI\fedora\shimx64.efi' >>"$LOG" 2>&1 ||
+    echo "warning: efibootmgr failed; relying on the fallback boot path" >>"$LOG"
+
+  # SELinux: rsync -X keeps labels if the image has them; otherwise relabel.
+  local policy=$TARGET/etc/selinux/targeted/contexts/files/file_contexts ctx
+  if [[ -f $policy ]]; then
+    ctx=$(stat -c %C "$TARGET/etc/passwd" 2>/dev/null || true)
+    if [[ $ctx != *:*:*:* ]]; then
+      if command -v setfiles >/dev/null && command -v selinuxenabled >/dev/null && selinuxenabled; then
+        setfiles -F -r "$TARGET" "$policy" "$TARGET" >>"$LOG" 2>&1 || touch "$TARGET/.autorelabel"
+      else
+        touch "$TARGET/.autorelabel"
+      fi
+    fi
+  fi
+  sync
+}
+
+s_finish() {
+  sync
+  umount -R "$TARGET" || umount -R -l "$TARGET"
+  udevadm settle
+  cryptsetup close "$CRYPT" || echo "warning: could not close $CRYPT" >>"$LOG"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  trap cleanup EXIT
+  preflight "$@"
+  find_source
+  prompts
+
+  P_ESP=$(part_path "$DISK" 1)
+  P_BOOT=$(part_path "$DISK" 2)
+  P_LUKS=$(part_path "$DISK" 3)
+  export DISK P_ESP P_BOOT P_LUKS TARGET CRYPT LOG NEW_HOSTNAME NEW_USER TZ_NAME KB_LAYOUT
+  export LUKS_PASS USER_PASS SRC
+  export -f run chr
+
+  SECONDS=0
+  clear
+  gum style --bold "Installing to $DISK"
+
+  step "Partitioning" s_partition
+  CRYPT_OPEN=1
+  step "Encrypting and formatting" s_format
+  unset LUKS_PASS
+
+  LUKS_UUID=$(blkid -s UUID -o value "$P_LUKS")
+  BTRFS_UUID=$(blkid -s UUID -o value "/dev/mapper/$CRYPT")
+  BOOT_UUID=$(blkid -s UUID -o value "$P_BOOT")
+  ESP_UUID=$(blkid -s UUID -o value "$P_ESP")
+  export LUKS_UUID BTRFS_UUID BOOT_UUID ESP_UUID
+
+  STEP=$((STEP + 1))
+  gum style "[$STEP/$TOTAL] Copying system"
+  copy_system
+
+  step "Configuring system and bootloader" s_configure
+  unset USER_PASS
+  step "Finishing" s_finish
+  CRYPT_OPEN=0
+
+  local elapsed=$SECONDS
+  gum style --border rounded --border-foreground 46 --padding "1 3" --margin "1 0" --bold \
+    "Done in ${elapsed}s" "Remove the install media before rebooting."
+  local next
+  next=$(gum choose --header "Next" "Reboot now" "Back to live desktop") || exit 0
+  [[ $next == "Reboot now" ]] && systemctl reboot
+  exit 0
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

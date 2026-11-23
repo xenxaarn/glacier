@@ -1,11 +1,38 @@
 #!/bin/bash
+# Runs as root at live boot only.
 set -e
 
 mkdir -p /etc/dconf/db/local.d
 
-cat > /etc/dconf/db/local.d/99-live-installer <<'EOF'
+cat >/etc/dconf/db/local.d/99-live-installer <<'EOT'
 [org/gnome/shell]
-favorite-apps=['org.gnome.Settings.desktop', 'firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'kitty.desktop', 'anaconda.desktop']
-EOF
+favorite-apps=['org.gnome.Settings.desktop', 'firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop', 'kitty.desktop', 'glacier-installer.desktop']
+EOT
 
 dconf update
+
+# Launcher for the dock and app grid.
+cat >/usr/share/applications/glacier-installer.desktop <<'EOT'
+[Desktop Entry]
+Type=Application
+Name=Install Glacier
+Comment=Install Glacier to disk
+Exec=kitty --class glacier-installer --title "Install Glacier" /usr/bin/glacier-install
+Icon=system-software-install
+Terminal=false
+Categories=System;
+EOT
+
+mkdir -p /etc/xdg/autostart
+cat >/etc/xdg/autostart/glacier-installer.desktop <<'EOT'
+[Desktop Entry]
+Type=Application
+Name=Install Glacier
+Exec=kitty --start-as=maximized --class glacier-installer --title "Install Glacier" /usr/bin/glacier-install
+X-GNOME-Autostart-enabled=true
+EOT
+
+# glacier-install re-runs itself through "sudo -n".
+mkdir -p /etc/sudoers.d
+echo '%wheel ALL=(root) NOPASSWD: /usr/bin/glacier-install' >/etc/sudoers.d/glacier-installer
+chmod 0440 /etc/sudoers.d/glacier-installer

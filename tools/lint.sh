@@ -9,7 +9,8 @@ if ! command -v shellcheck >/dev/null 2>&1; then
 fi
 
 echo "==> shellcheck"
-shellcheck -S warning build.sh config.sh tools/*.sh root/usr/libexec/glacier-branding
+shellcheck -S warning build.sh config.sh tools/*.sh root/usr/libexec/glacier-branding \
+	root/usr/bin/glacier-install root/var/lib/livesys/livesys-session-extra
 shellcheck -s sh root/etc/fstab.script root/etc/profile.d/editor.sh
 
 echo "==> Glacier.kiwi / dconf"

@@ -100,4 +100,5 @@ fi
 XDG_CONFIG_HOME=/etc/skel/.config XDG_DATA_HOME=/etc/skel/.local/share XDG_STATE_HOME=/tmp/nvs XDG_CACHE_HOME=/tmp/nvc nvim --headless "+$lazy_cmd" +qa
 rm -rf /tmp/nvs /tmp/nvc
 test -d /etc/skel/.local/share/nvim/lazy/LazyVim
+chmod 0755 /usr/bin/glacier-install
 echo "Glacier image configuration complete"

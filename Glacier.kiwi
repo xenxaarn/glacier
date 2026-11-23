@@ -153,6 +153,14 @@
 		<namedCollection name="anaconda-tools"/>
 		<package name="anaconda-install-env-deps"/>
 		<package name="anaconda-live"/>
+		<package name="gum"/>
+		<package name="gdisk"/>
+		<package name="dosfstools"/>
+		<package name="e2fsprogs"/>
+		<package name="cryptsetup"/>
+		<package name="rsync"/>
+		<package name="efibootmgr"/>
+		<package name="grub2-tools"/>
 		<package name="aajohan-comfortaa-fonts"/>
 		<package name="dracut-live"/>
 		<package name="gawk"/>
