@@ -38,6 +38,8 @@ SRC_MOUNTED=0
 CRYPT_OPEN=0
 STEP=0
 TOTAL=5
+T0=0
+TIMES=()
 
 # ---------------------------------------------------------------- helpers
 
@@ -54,6 +56,13 @@ run() {
   }
 }
 
+# Record how long the phase that just finished took (SECONDS since the last mark).
+mark() {
+  TIMES+=("$(printf '%-32s %4ss' "$1" "$((SECONDS - T0))")")
+  echo "timing: $1 $((SECONDS - T0))s" >>"$LOG"
+  T0=$SECONDS
+}
+
 # Run a command inside the target root.
 chr() { chroot "$TARGET" "$@"; }
 
@@ -63,6 +72,7 @@ step() {
   declare -fx "$fn"
   gum spin --spinner dot --show-error --title "[$STEP/$TOTAL] $title" -- \
     bash -c "set -Eeuo pipefail; $fn"
+  mark "$title"
 }
 
 part_path() { # part_path /dev/nvme0n1 2 -> /dev/nvme0n1p2, /dev/sda 2 -> /dev/sda2
@@ -388,8 +398,11 @@ GRUB_ENABLE_BLSCFG=true
 GRUB_CMDLINE_LINUX="$CMDLINE"
 EOF
 
+  local t=$SECONDS
   rm -f "$TARGET/etc/machine-id"
   run systemctl --root="$TARGET" preset-all --preset-mode=enable-only
+  echo "timing:   preset-all $((SECONDS - t))s" >>"$LOG"
+  t=$SECONDS
   for mp in dev dev/pts proc sys; do mkdir -p "$TARGET/$mp"; done
   run mount --rbind /dev "$TARGET/dev"
   run mount --make-rslave "$TARGET/dev"
@@ -433,10 +446,14 @@ EOF
       return 1
     }
 
+  echo "timing:   kernel-install/dracut $((SECONDS - t))s" >>"$LOG"
+  t=$SECONDS
+
   # GRUB config + the stub the signed grubx64.efi reads from the ESP.
   mkdir -p "$TARGET/boot/grub2"
   run chr grub2-editenv /boot/grub2/grubenv create
   run chr grub2-mkconfig -o /boot/grub2/grub.cfg
+  echo "timing:   grub2-mkconfig $((SECONDS - t))s" >>"$LOG"
   [[ -f $TARGET/boot/efi/EFI/fedora/shimx64.efi ]] ||
     {
       echo "shimx64.efi missing from the image's ESP files" >&2
@@ -491,6 +508,7 @@ main() {
   export -f run chr
 
   SECONDS=0
+  T0=0
   clear
   gum style --bold "Installing to $DISK"
 
@@ -508,6 +526,7 @@ main() {
   STEP=$((STEP + 1))
   gum style "[$STEP/$TOTAL] Copying system"
   copy_system
+  mark "Copying system"
 
   step "Configuring system and bootloader" s_configure
   unset USER_PASS
@@ -516,7 +535,7 @@ main() {
 
   local elapsed=$SECONDS
   gum style --border rounded --border-foreground 46 --padding "1 3" --margin "1 0" --bold \
-    "Done in ${elapsed}s" "Remove the install media before rebooting."
+    "Done in ${elapsed}s" "" "${TIMES[@]}" "" "Remove the install media before rebooting."
   local next
   next=$(gum choose --header "Next" "Reboot now" "Back to live desktop") || exit 0
   [[ $next == "Reboot now" ]] && systemctl reboot
